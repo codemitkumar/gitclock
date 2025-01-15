@@ -6,6 +6,7 @@ const http = require("http");
 const querystring = require("querystring");
 const axios = require("axios");
 require("dotenv").config({ path: path.resolve(__dirname, ".env") });
+
 const CLIENT_ID = process.env.CLIENT_ID;
 const CLIENT_SECRET = process.env.CLIENT_SECRET;
 const AUTH_URL = process.env.AUTH_URL;
@@ -13,9 +14,8 @@ const TOKEN_URL = process.env.TOKEN_URL;
 const REDIRECT_URI = process.env.REDIRECT_URI;
 const GITHUB_API_URL = process.env.GITHUB_API_URL;
 const REPO_NAME = process.env.REPO_NAME;
-/**
- * @param {vscode.ExtensionContext} context
- */
+const MIN_COMMIT_INTERVAL = 30;
+let commitInterval = MIN_COMMIT_INTERVAL * 60 * 1000; 
 
 async function handleRepoAndChangelog(accessToken, changedFiles) {
   try {
@@ -24,7 +24,7 @@ async function handleRepoAndChangelog(accessToken, changedFiles) {
     });
 
     const username = userResponse.data.login;
-    const today = new Date().toISOString().split("T")[0]; // Format: YYYY-MM-DD
+    const today = new Date().toISOString().split("T")[0];
     const changelogFileName = `CHANGELOG_${today}.md`;
 
     let contentsResponse;
@@ -118,6 +118,7 @@ This file logs the changes made on ${new Date().toLocaleDateString()}.
 ${changesList}
 `;
 }
+
 async function updateFile(accessToken, username, file, content) {
   try {
     await axios.put(
@@ -158,6 +159,45 @@ async function createFile(accessToken, username, fileName, content) {
 }
 
 async function activate(context) {
+  const setIntervalCommand = vscode.commands.registerCommand(
+    'gitclock.setCommitInterval',
+    async () => {
+      const input = await vscode.window.showInputBox({
+        prompt: `Enter commit interval in minutes (minimum ${MIN_COMMIT_INTERVAL} minutes)`,
+        value: String(commitInterval / (60 * 1000)), 
+        validateInput: (value) => {
+          const num = parseInt(value);
+          if (isNaN(num) || !Number.isInteger(num)) {
+            return 'Please enter a valid number';
+          }
+          if (num < MIN_COMMIT_INTERVAL) {
+            return `Commit interval cannot be less than ${MIN_COMMIT_INTERVAL} minutes`;
+          }
+          return null; 
+        }
+      });
+      
+      if (input) {
+        const newInterval = parseInt(input);
+        if (newInterval >= MIN_COMMIT_INTERVAL) {
+          commitInterval = newInterval * 60 * 1000;
+          vscode.window.showInformationMessage(
+            `Commit interval set to ${newInterval} minutes`
+          );
+          
+          context.globalState.update('gitClockCommitInterval', commitInterval);
+        }
+      }
+    }
+  );
+  
+  context.subscriptions.push(setIntervalCommand);
+
+  const savedInterval = context.globalState.get('gitClockCommitInterval');
+  if (savedInterval && savedInterval >= MIN_COMMIT_INTERVAL * 60 * 1000) {
+    commitInterval = savedInterval;
+  }
+
   const disposable = vscode.commands.registerCommand(
     "gitclock.startOAuth",
     async function () {
@@ -165,6 +205,7 @@ async function activate(context) {
         const { default: open } = await import("open");
         vscode.window.showInformationMessage("Opening GitHub login page...");
         open(AUTH_URL);
+        
         const server = http.createServer(async (req, res) => {
           if (req.url.startsWith("/oauthCallback")) {
             const queryParams = querystring.parse(req.url.split("?")[1]);
@@ -227,23 +268,34 @@ async function activate(context) {
   );
 
   context.subscriptions.push(disposable);
+
   const accessToken = context.globalState.get("githubAccessToken");
+  
   if (!accessToken) {
     vscode.window.showErrorMessage(
       "You are not authenticated. Please log in using GitHub."
     );
   } else {
-    checkAndCreateRepo(accessToken);
-    monitorFileChanges(accessToken);
+    await checkAndCreateRepo(accessToken);
+    
+    const stopMonitoring = await monitorFileChanges(accessToken);
+    
+    context.subscriptions.push({
+      dispose: () => {
+        if (stopMonitoring) {
+          stopMonitoring();
+        }
+      }
+    });
   }
 }
+
 async function monitorFileChanges(accessToken) {
   const currentWorkingDir = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
 
   if (!currentWorkingDir) {
     return;
   }
-
 
   setInterval(async () => {
     exec(
@@ -285,7 +337,6 @@ async function monitorFileChanges(accessToken) {
             })
         );
 
-
         try {
           await handleRepoAndChangelog(accessToken, changedFiles);
           vscode.window.showInformationMessage("Changes logged successfully!");
@@ -293,7 +344,7 @@ async function monitorFileChanges(accessToken) {
         }
       }
     );
-  }, 30 * 60 * 1000);
+  }, commitInterval);
 }
 
 function getDiffStats(cwd, fileName) {
@@ -388,7 +439,8 @@ GitClock is an automation extension for Visual Studio Code that ensures your Git
 
 ## Features
 
-- **Automatic Commit Every 30 Minutes**: The extension automatically commits changes every 30 minutes to ensure that your work is regularly logged on main branch so that your git contribution is counted.
+- **Customizable Commit Intervals**: Set your preferred commit interval through VS Code commands.
+- **Automatic Commit**: The extension automatically commits changes based on your set interval to ensure that your work is regularly logged on main branch.
 - **Sync Logs in Main Branch**: All your sync logs are stored in the \`main\` branch, ensuring that your contributions are tracked, even if you're working on a different branch.
 - **Keeps Track of Your Hard Work**: By syncing your changes to the main branch, your contributions are always counted in the repository history, providing visibility of your continuous progress.
 - **Works on Any Branch**: No need to worry about not being on the main branch. \`gitClock\` ensures your work is recorded regardless of the branch you're working on.
@@ -408,15 +460,16 @@ GitClock is an automation extension for Visual Studio Code that ensures your Git
 ## Usage
 1. After installation, activate the extension via the **Command Palette** (\`Ctrl+Shift+P\` / \`Cmd+Shift+P\`).
 2. Search for \`GitClock: Authenticate\` and select it to authenticate the extension with the profile where you want your contributions to be counted.
+3. (Optional) Use \`GitClock: Set Commit Interval\` to customize how often changes are committed.
 
 ## Contributing
-- Fork the repository.
+- Fork the repository
 - Clone your fork: git clone https://github.com/your-username/your-extension-name.git
 - Install dependencies: npm install
-- Make your changes.
+- Make your changes
 - Test extension
-- Commit and push your changes.
-- Create a pull request with a description of what you've changed.
+- Commit and push your changes
+- Create a pull request with a description of what you've changed
 
 ## License
 This extension is licensed under the MIT License. See LICENSE for more details.
