@@ -14,8 +14,8 @@ const TOKEN_URL = process.env.TOKEN_URL;
 const REDIRECT_URI = process.env.REDIRECT_URI;
 const GITHUB_API_URL = process.env.GITHUB_API_URL;
 const REPO_NAME = process.env.REPO_NAME;
-
-let commitInterval = 30 * 60 * 1000;
+const MIN_COMMIT_INTERVAL = 30;
+let commitInterval = MIN_COMMIT_INTERVAL * 60 * 1000; 
 
 async function handleRepoAndChangelog(accessToken, changedFiles) {
   try {
@@ -163,21 +163,40 @@ async function activate(context) {
     'gitclock.setCommitInterval',
     async () => {
       const input = await vscode.window.showInputBox({
-        prompt: 'Enter commit interval in minutes',
+        prompt: `Enter commit interval in minutes (minimum ${MIN_COMMIT_INTERVAL} minutes)`,
+        value: String(commitInterval / (60 * 1000)), 
         validateInput: (value) => {
           const num = parseInt(value);
-          return (!isNaN(num) && num > 0) ? null : 'Please enter a valid positive number';
+          if (isNaN(num) || !Number.isInteger(num)) {
+            return 'Please enter a valid number';
+          }
+          if (num < MIN_COMMIT_INTERVAL) {
+            return `Commit interval cannot be less than ${MIN_COMMIT_INTERVAL} minutes`;
+          }
+          return null; 
         }
       });
       
       if (input) {
-        commitInterval = parseInt(input) * 60 * 1000;
-        vscode.window.showInformationMessage(`Commit interval set to ${input} minutes`);
+        const newInterval = parseInt(input);
+        if (newInterval >= MIN_COMMIT_INTERVAL) {
+          commitInterval = newInterval * 60 * 1000;
+          vscode.window.showInformationMessage(
+            `Commit interval set to ${newInterval} minutes`
+          );
+          
+          context.globalState.update('gitClockCommitInterval', commitInterval);
+        }
       }
     }
   );
   
   context.subscriptions.push(setIntervalCommand);
+
+  const savedInterval = context.globalState.get('gitClockCommitInterval');
+  if (savedInterval && savedInterval >= MIN_COMMIT_INTERVAL * 60 * 1000) {
+    commitInterval = savedInterval;
+  }
 
   const disposable = vscode.commands.registerCommand(
     "gitclock.startOAuth",
@@ -186,6 +205,7 @@ async function activate(context) {
         const { default: open } = await import("open");
         vscode.window.showInformationMessage("Opening GitHub login page...");
         open(AUTH_URL);
+        
         const server = http.createServer(async (req, res) => {
           if (req.url.startsWith("/oauthCallback")) {
             const queryParams = querystring.parse(req.url.split("?")[1]);
@@ -248,14 +268,25 @@ async function activate(context) {
   );
 
   context.subscriptions.push(disposable);
+
   const accessToken = context.globalState.get("githubAccessToken");
+  
   if (!accessToken) {
     vscode.window.showErrorMessage(
       "You are not authenticated. Please log in using GitHub."
     );
   } else {
-    checkAndCreateRepo(accessToken);
-    monitorFileChanges(accessToken);
+    await checkAndCreateRepo(accessToken);
+    
+    const stopMonitoring = await monitorFileChanges(accessToken);
+    
+    context.subscriptions.push({
+      dispose: () => {
+        if (stopMonitoring) {
+          stopMonitoring();
+        }
+      }
+    });
   }
 }
 
