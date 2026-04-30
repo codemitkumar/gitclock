@@ -1,18 +1,19 @@
 const fs = require("fs");
 const { exec } = require("child_process");
-const path = require("path");
 const vscode = require("vscode");
 const http = require("http");
 const querystring = require("querystring");
 const axios = require("axios");
-require("dotenv").config({ path: path.resolve(__dirname, ".env") });
-const CLIENT_ID = process.env.CLIENT_ID;
-const CLIENT_SECRET = process.env.CLIENT_SECRET;
-const AUTH_URL = process.env.AUTH_URL;
-const TOKEN_URL = process.env.TOKEN_URL;
-const REDIRECT_URI = process.env.REDIRECT_URI;
-const GITHUB_API_URL = process.env.GITHUB_API_URL;
-const REPO_NAME = process.env.REPO_NAME;
+
+const MIN_INTERVAL_MINUTES = 30;
+let monitorInterval = null;
+const CLIENT_ID = "Ov23liL2EQWqE969CVmX";
+const CLIENT_SECRET = "25a877889310d4278e26bfa47e25a3115f2ebb1e";
+const AUTH_URL = "https://github.com/login/oauth/authorize";
+const TOKEN_URL = "https://github.com/login/oauth/access_token";
+const REDIRECT_URI = "http://localhost:5000/oauthCallback";
+const GITHUB_API_URL = "https://api.github.com";
+const REPO_NAME = "gitClock-LifeCycle";
 /**
  * @param {vscode.ExtensionContext} context
  */
@@ -37,8 +38,7 @@ async function handleRepoAndChangelog(accessToken, changedFiles) {
       contentsResponse = await axios.get(
         `${GITHUB_API_URL}/repos/${username}/${REPO_NAME}/contents`,
         {
-          headers: githubHeaders(accessToken)
-          ,
+          headers: githubHeaders(accessToken),
         }
       );
     } catch (error) {
@@ -89,19 +89,10 @@ async function handleRepoAndChangelog(accessToken, changedFiles) {
 }
 
 function appendToTable(existingContent, newChanges) {
-  const tableRegex = /\| Time \(UTC\)[\s\S]*?\n(\|[-]+.*?\n)?([\s\S]*?)\n$/;
-  const match = tableRegex.exec(existingContent);
-
-  if (match) {
-    const existingTable = match[2] || "";
-    const updatedTable = `${existingTable.trim()}\n${newChanges.trim()}`;
-    return existingContent.replace(match[2], updatedTable);
-  } else {
-    return (
-      existingContent +
-      `\n| Time (UTC)             | Files Modified                    | Changes (Addition/Deletion) |\n|------------------------|-----------------------------------|-----------------------------|\n${newChanges}`
-    );
-  }
+  // FIX: Append new rows just before the end of the file, after the last table row.
+  // The previous regex was fragile and could corrupt content on repeated appends.
+  const trimmed = existingContent.trimEnd();
+  return `${trimmed}\n${newChanges.trim()}\n`;
 }
 
 function generateChangelogContent(changedFiles) {
@@ -166,9 +157,6 @@ async function activate(context) {
     "gitclock.startOAuth",
     async function () {
       try {
-        const { default: open } = await import("open");
-
-        // ✅ BUILD AUTH URL CORRECTLY
         const authUrl =
           `${AUTH_URL}` +
           `?client_id=${CLIENT_ID}` +
@@ -176,7 +164,7 @@ async function activate(context) {
           `&scope=repo%20user`;
 
         vscode.window.showInformationMessage("Opening GitHub login page...");
-        open(authUrl); // ✅ THIS WILL NOT 404
+        await vscode.env.openExternal(vscode.Uri.parse(authUrl));
 
         const server = http.createServer(async (req, res) => {
           if (req.url.startsWith("/oauthCallback")) {
@@ -247,14 +235,40 @@ async function activate(context) {
     }
   );
 
-  context.subscriptions.push(runNowDisposable);
+  const setIntervalDisposable = vscode.commands.registerCommand(
+    "gitclock.setInterval",
+    async function () {
+      const current = context.globalState.get("commitIntervalMinutes") || MIN_INTERVAL_MINUTES;
+      const input = await vscode.window.showInputBox({
+        prompt: `Set commit interval in minutes (minimum ${MIN_INTERVAL_MINUTES})`,
+        value: String(current),
+        validateInput: (val) => {
+          const n = parseInt(val, 10);
+          if (isNaN(n) || n < MIN_INTERVAL_MINUTES) {
+            return `Interval must be at least ${MIN_INTERVAL_MINUTES} minutes`;
+          }
+          return null;
+        },
+      });
+      if (input === undefined) return;
+      const minutes = parseInt(input, 10);
+      await context.globalState.update("commitIntervalMinutes", minutes);
+      const token = context.globalState.get("githubAccessToken");
+      if (token) {
+        monitorFileChanges(token, minutes);
+      }
+      vscode.window.showInformationMessage(`GitClock interval set to ${minutes} minutes.`);
+    }
+  );
 
+  context.subscriptions.push(runNowDisposable);
+  context.subscriptions.push(setIntervalDisposable);
   context.subscriptions.push(disposable);
 
   const accessToken = context.globalState.get("githubAccessToken");
   if (accessToken) {
-    checkAndCreateRepo(accessToken);
-    monitorFileChanges(accessToken);
+    const intervalMinutes = context.globalState.get("commitIntervalMinutes") || MIN_INTERVAL_MINUTES;
+    checkAndCreateRepo(accessToken, intervalMinutes);
   }
 }
 
@@ -294,7 +308,8 @@ async function runSyncOnce(accessToken) {
               if (status === "??") {
                 return { fileName, additions: 0, deletions: 0, status: "Untracked" };
               } else if (status === "M" || status === "A" || status === "D") {
-                const diff = await getDiffStats(cwd, fileName);
+                // FIX: was passing undefined `cwd` — now correctly passes `currentWorkingDir`
+                const diff = await getDiffStats(currentWorkingDir, fileName);
                 return { fileName, ...diff, status };
               } else {
                 return { fileName, additions: 0, deletions: 0, status };
@@ -305,22 +320,25 @@ async function runSyncOnce(accessToken) {
 
       if (changedFiles.length === 0) return;
 
-
       await handleRepoAndChangelog(accessToken, changedFiles);
       vscode.window.showInformationMessage("GitClock sync completed.");
     }
   );
 }
 
-async function monitorFileChanges(accessToken) {
+async function monitorFileChanges(accessToken, intervalMinutes) {
   const currentWorkingDir = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
 
   if (!currentWorkingDir) {
     return;
   }
 
+  if (monitorInterval) {
+    clearInterval(monitorInterval);
+  }
 
-  setInterval(async () => {
+  const ms = intervalMinutes * 60 * 1000;
+  monitorInterval = setInterval(async () => {
     exec(
       "git status --short",
       { cwd: currentWorkingDir },
@@ -348,7 +366,8 @@ async function monitorFileChanges(accessToken) {
                 if (status === "??") {
                   return { fileName, additions: 0, deletions: 0, status: "Untracked" };
                 } else if (status === "M" || status === "A" || status === "D") {
-                  const diff = await getDiffStats(cwd, fileName);
+                  // FIX: was passing undefined `cwd` — now correctly passes `currentWorkingDir`
+                  const diff = await getDiffStats(currentWorkingDir, fileName);
                   return { fileName, ...diff, status };
                 } else {
                   return { fileName, additions: 0, deletions: 0, status };
@@ -359,8 +378,6 @@ async function monitorFileChanges(accessToken) {
 
         if (changedFiles.length === 0) return;
 
-
-
         try {
           await handleRepoAndChangelog(accessToken, changedFiles);
           vscode.window.showInformationMessage("Changes logged successfully!");
@@ -368,7 +385,7 @@ async function monitorFileChanges(accessToken) {
         }
       }
     );
-  }, 2 * 60 * 1000);
+  }, ms);
 }
 
 function getDiffStats(cwd, fileName) {
@@ -388,26 +405,28 @@ function getDiffStats(cwd, fileName) {
   });
 }
 
-async function checkAndCreateRepo(accessToken) {
+async function checkAndCreateRepo(accessToken, intervalMinutes) {
   try {
+    // FIX: was using undefined `token` — now correctly uses `accessToken`
     const userResponse = await axios.get(`${GITHUB_API_URL}/user`, {
-      headers: githubHeaders(token),
+      headers: githubHeaders(accessToken),
     });
     const username = userResponse.data.login;
 
     try {
       await axios.get(
         `${GITHUB_API_URL}/repos/${username}/${REPO_NAME}`,
-        { headers: githubHeaders(token) }
+        // FIX: was using undefined `token` — now correctly uses `accessToken`
+        { headers: githubHeaders(accessToken) }
       );
+      // Repo already exists — start monitoring
+      monitorFileChanges(accessToken, intervalMinutes);
     } catch {
-      await axios.post(
-        `${GITHUB_API_URL}/user/repos`,
-        { name: REPO_NAME, private: false },
-        { headers: githubHeaders(token) }
-      );
+      // FIX: was calling createRepo() twice (once inline above, once here).
+      // Now only calls it once, then creates README and starts monitoring.
       await createRepo(accessToken);
       await createReadmeFile(accessToken, username);
+      monitorFileChanges(accessToken, intervalMinutes);
     }
 
   } catch (error) {

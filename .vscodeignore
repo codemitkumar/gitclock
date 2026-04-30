@@ -9,3 +9,6 @@ vsc-extension-quickstart.md
 **/eslint.config.mjs
 **/.vscode-test.*
 .env
+node_modules/**
+extension.js
+package-lock.json
